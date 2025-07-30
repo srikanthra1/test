@@ -1,0 +1,82 @@
+//JOBNAME   JOB CLASS=A,
+//             MSGCLASS=H,
+//             NOTIFY=&SYSUID
+//*
+//* ***** Edit with CAPS OFF and NUMBER OFF *****
+//*
+//* Run a Java program using JZOS Batch Launcher
+//*
+//G        EXEC PGM=JVMLDM80,REGION=0M,
+//   PARM='/ -jar /u/myuserid/java/SMFCompress-2.1.0.jar'
+//*
+//* Location of JZOS module JVMLDM80
+//STEPLIB  DD DISP=SHR,DSN=JZOS.LINKLIBE
+//*
+//INPUT    DD DSN=SMF.RECORDS,DISP=SHR
+//OUTPUT   DD DSN=SMF.RECORDS.GZ,
+//        DISP=(NEW,CATLG),
+//        RECFM=FB,LRECL=1024,
+//        SPACE=(CYL,(100,100),RLSE)
+//*
+//* Record types to include
+//* Note: These are the record types currently used by EasySMF.
+//*       You may wish to include additional record types so that
+//*       you can go back and look at the history when new reports
+//*       are added. EasySMF can also export data for use by other
+//*       tools e.g. IBM upgrade planning tools so EasySMF can be
+//*       a useful repository for general SMF data storage.
+//*
+//MAINARGS DD *
+0
+2
+3
+7
+14
+15
+17
+18
+30
+42.6
+42.9
+42.10
+42.20
+42.21
+42.24
+42.25
+60
+61
+62
+64
+65
+66
+70
+71.1
+72.3
+74.1
+75.1
+80
+92
+113
+119
+//SYSPRINT DD SYSOUT=*
+//SYSOUT   DD SYSOUT=*
+//STDOUT   DD SYSOUT=*
+//STDERR   DD SYSOUT=*
+//CEEDUMP  DD SYSOUT=*
+//ABNLIGNR DD DUMMY
+//* Configure for JZOS: based on JVMJCL80/JVMPRC80
+//*
+//STDENV   DD *
+export JAVA_HOME=/usr/lpp/java/J8.0
+export PATH=/bin:"${JAVA_HOME}"/bin
+
+LIBPATH=/lib:/usr/lib:"${JAVA_HOME}"/bin
+LIBPATH="$LIBPATH":"${JAVA_HOME}"/lib/s390
+LIBPATH="$LIBPATH":"${JAVA_HOME}"/lib/s390/j9vm
+LIBPATH="$LIBPATH":"${JAVA_HOME}"/bin/classic
+export LIBPATH="$LIBPATH":
+
+export CLASSPATH="."
+
+IJO="-Xms16m -Xmx128m"
+export IBM_JAVA_OPTIONS="$IJO "

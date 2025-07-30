@@ -1,0 +1,290 @@
+package com.blackhillsoftware.easysmf;
+
+import java.io.BufferedOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.util.*;
+import java.util.zip.GZIPOutputStream;
+
+import com.ibm.jzos.RDWOutputRecordStream;
+import com.ibm.jzos.RecordReader;
+import com.ibm.jzos.ZFile;
+import com.ibm.jzos.ZFileException;
+import com.ibm.jzos.fields.daa.*;
+
+public class Compress 
+{
+	static final int RDWLENGTH = 4;
+	static final int SUBTYPEFLAG = 0x40;
+	
+	static final int MB = 1024 * 1024;
+	
+	static final BinaryUnsignedIntL1Field flags = new BinaryUnsignedIntL1Field(4 - RDWLENGTH);    
+	static final BinaryUnsignedIntL1Field recordtype = new BinaryUnsignedIntL1Field(5 - RDWLENGTH);    
+	static final BinaryUnsignedIntL2Field subtype = new BinaryUnsignedIntL2Field(22 - RDWLENGTH);    
+	static final BinaryUnsignedIntL2Field type84subtype = new BinaryUnsignedIntL2Field(24 - RDWLENGTH);    
+	
+	public static void main(String[] args) throws IOException 
+    {
+		long recordsIn = 0;
+        long bytesIn = 0;
+        long recordsOut = 0;
+        long bytesOut = 0;
+        long compressedBytesOut = 0;
+           
+        RecordReader input = null;
+        ZFile zFileOut = null;
+        OutputStream outstream = null;
+    	RDWOutputRecordStream rdwoutstream = null;
+    	
+    	// Build list of required types/subtypes from arguments
+        Map<Integer, Set<Integer>> typeSubtypes = smfTypesFromArgs(args);
+        
+        // Map for type/subtype statistics
+        Map<Integer, Map<Integer, RecordStats>> recordStats = new HashMap<>();
+    	         
+        try 
+        {
+        	// Read records from input file
+        	input = RecordReader.newReaderForDD("INPUT");
+        	
+        	// Treat the output file as a stream, but it is likely to be
+        	// e.g. FB, LRECL = anything.
+        	zFileOut = new ZFile("//DD:OUTPUT", "wb,noseek");
+        	   
+        	byte[] buffer = new byte[input.getLrecl()];
+        	
+        	// wrap output stream in a GZIPOutputStream and a BufferedOutputStream
+        	// GZIPOutputStream needs 4K output buffer for zEDC deflate
+        	// Buffer passed to GZIPOutputStream needs to be 64K to trigger zEDC
+        	// To guarantee 64K write, BufferedOutputStream needs to be 
+        	// 64K+recordlength-1 so that write of max record length doesn't 
+        	// trigger a flush of less than 64K.
+        	// zEDC elapsed time chart shows advantages with larger buffers up
+        	// to around 256K
+        	
+        	// Some reports of extreme performance degradation when the
+        	// output dataset is zEDC compressed (but unable to reproduce)
+        	// To try to avoid that we will put another buffer between
+        	// the GZIP stream and the zFileOut stream.
+        	
+        	outstream = 
+        		new BufferedOutputStream(
+        			new GZIPOutputStream(
+        				new BufferedOutputStream(
+        						zFileOut.getOutputStream(), 
+        						256 * 1024), 
+        				4096),
+        			256 * 1024);
+
+       		rdwoutstream = new RDWOutputRecordStream(outstream);
+        		       	
+    		int bytesRead; 
+            while ((bytesRead = input.read(buffer)) >= 0) 
+            {
+                recordsIn++;
+                bytesIn += bytesRead + RDWLENGTH;
+                
+        		int recordType = recordtype.getInt(buffer);
+        		int subType = getSubType(buffer, recordType);
+        		
+        		recordStats.computeIfAbsent(recordType, key -> new HashMap<>())
+	        		.computeIfAbsent(subType, key -> new RecordStats(recordType, subType))
+	        		.addInput(bytesRead + RDWLENGTH);
+
+                if (includeRecord(typeSubtypes, recordType, subType))
+                {
+                	recordsOut++;
+                	bytesOut += bytesRead + RDWLENGTH;
+                	recordStats
+                		.get(recordType)
+                		.get(subType)
+                		.addOutput(bytesRead + RDWLENGTH);
+                	rdwoutstream.write(buffer, 0, bytesRead);
+                }
+            }
+            
+            // flush stream to get best estimate of output bytes
+            // from zFileOut. There may still be some bytes in the
+            // compressor because we didn't use syncFlush=true 
+            // when creating the GZIPOutputStream.
+            outstream.flush();
+            compressedBytesOut = zFileOut.getByteCount();      	
+        }
+        finally 
+        {
+        	if (input != null) 
+        	{
+	        	try 
+	        	{
+	    	       input.close(); 
+	    	    } 
+	        	catch (ZFileException zfe) 
+	        	{
+	    	       zfe.printStackTrace();
+	    	    }    
+        	}
+        	if (rdwoutstream != null) 
+        	{
+	        	try 
+	        	{
+	        		rdwoutstream.close(); 
+	    	    } 
+	        	catch (IOException ioe) 
+	        	{
+	    	       ioe.printStackTrace();
+	    	    }    
+        	}
+        	else if (outstream != null) 
+        	{
+	        	try 
+	        	{
+	        		outstream.close(); 
+	    	    } 
+	        	catch (IOException ioe) 
+	        	{
+	    	       ioe.printStackTrace();
+	    	    }    
+        	}
+        }
+        
+        System.out.format("%5s %8s %11s %11s %11s %11s%n", 
+                "Type", "Subtype", "Records In", "Records Out", "MB In", "MB Out");
+
+            // write data
+        recordStats.entrySet().stream() 					 // get Map entries (keyed by SMF type)
+                .map(entry -> entry.getValue())				 // get inner Maps (keyed by subtype)
+                .flatMap(entry -> entry.entrySet().stream()) // flatten Map contents into one stream 
+                .map(entry -> entry.getValue()) 			 // get value (RecordStats entry)
+                .sorted(Comparator
+                		.comparingInt(RecordStats::getRecordtype)
+                		.thenComparingInt(RecordStats::getSubtype))          
+
+                .forEachOrdered(entry -> 
+                    System.out.format("%5d %8d %,11d %,11d %,11.1f %,11.1f%n", 
+                        entry.getRecordtype(),
+                        entry.getSubtype(), 
+                        entry.getInCount(), 
+				        entry.getOutCount(), 
+                        (double)entry.getInBytes() / MB,
+				        (double)entry.getOutBytes() / MB));
+        
+        System.out.format("%n%nTotals: %,18d %,11d %,11.1f %,11.1f%n", recordsIn, recordsOut, (double)bytesIn / MB, (double)bytesOut / MB);
+        System.out.format("Compressed (approximate): %,36.1f%n", (double)compressedBytesOut / MB);
+        
+	}
+
+	private static int getSubType(byte[] buffer, int recordType) 
+	{
+		if ((flags.getInt(buffer) & SUBTYPEFLAG) == SUBTYPEFLAG)
+		{
+			if (recordType == 84) // special case 
+			{
+				return type84subtype.getInt(buffer);				
+			}
+			return subtype.getInt(buffer);
+		}
+		return 0;
+	}
+
+	private static boolean includeRecord(Map<Integer, Set<Integer>> typeSubtypes, int recordType, int subType) 
+	{
+		if (typeSubtypes.isEmpty())
+		{
+			return true;
+		}
+	    if (typeSubtypes.containsKey(recordType))
+	    {
+	    	Set<Integer> subtypes = typeSubtypes.get(recordType);
+	    	if (subtypes.isEmpty())
+	    	{
+	    		return true;
+	    	}
+	    	else
+	    	{
+	    		return subtypes.contains(subType);
+	    	}
+	    }
+		return false;
+	}
+
+	private static Map<Integer, Set<Integer>> smfTypesFromArgs(String[] args) 
+	{
+		Map<Integer, Set<Integer> > typeSubtypes = new HashMap<>(); 
+    	for (String arg : args)
+    	{
+			String sType = arg;
+			String sSubtype = null;
+			
+			// A period means type and subtype
+    		int period = arg.lastIndexOf(".");
+    		if (period > 0)
+    		{
+    			sType = arg.substring(0, period);
+    			sSubtype = arg.substring(period + 1);
+    		}
+
+			int recordType = Integer.parseInt(sType);
+    		
+    		if (sSubtype == null) // no subtype specified
+    		{
+    			if (typeSubtypes.containsKey(recordType) && !typeSubtypes.get(recordType).isEmpty())
+    			{
+    				System.err.println("Specific subtypes have already been selected for this type: " + arg);
+    				System.exit(1);
+    			}
+    			typeSubtypes.put(recordType, new HashSet<>());			
+    		}
+    		else // subtype specified
+    		{
+    			if (typeSubtypes.containsKey(recordType) && typeSubtypes.get(recordType).isEmpty())
+    			{
+    				System.err.println("All subtypes have already been selected for this type: " + arg);
+    				System.exit(1);
+    			}
+
+    			int subtype = Integer.parseInt(sSubtype);
+    			typeSubtypes
+    				.computeIfAbsent(recordType, x -> new HashSet<>())
+    				.add(subtype);
+    		}    		
+    	}
+		return typeSubtypes;
+	}
+	
+    private static class RecordStats
+    {
+        RecordStats(int recordType, int subType)
+        {
+            this.recordtype = recordType;
+            this.subtype = subType;
+        }
+
+        public void addInput(int length)
+        {
+            inCount++;
+            inBytes += length;
+        }
+        
+        public void addOutput(int length)
+        {
+            outCount++;
+            outBytes += length;
+        }
+
+        private int  recordtype;
+        private int  subtype;
+        private int  inCount = 0;
+        private long inBytes = 0;
+        private int  outCount = 0;
+        private long outBytes = 0;
+
+        int getRecordtype()	{ return recordtype; }
+        int getSubtype() 	{ return subtype; }
+        int getInCount() 	{ return inCount; }
+        long getInBytes() 	{ return inBytes; }  
+        int getOutCount() 	{ return outCount; }
+        long getOutBytes() 	{ return outBytes; }  
+    }
+	
+}
